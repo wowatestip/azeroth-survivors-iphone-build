@@ -55,6 +55,34 @@ jobs:
           cargo fetch --locked --target aarch64-apple-ios
           df -h .
 
+      - name: Test iPhone binary validation before compiling the game
+        run: |
+          set -euo pipefail
+          cat > logs/check-ios-binary.py <<'PY'
+          import subprocess, sys
+          binary = sys.argv[1]
+          # -verify_arch consumes the remaining arguments, so the file must come first.
+          subprocess.run(['xcrun', 'lipo', binary, '-verify_arch', 'arm64'], check=True)
+          headers = subprocess.check_output(['xcrun', 'vtool', '-show-build', binary], text=True)
+          platforms = [line.split()[1:] for line in headers.splitlines()
+                       if line.split()[:1] == ['platform']]
+          if platforms != [['IOS']]:
+              raise SystemExit('Expected an iPhone device binary, got:\n' + headers)
+          print(headers)
+          PY
+          printf 'int main(void) { return 0; }\n' > logs/probe.c
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 \
+            -c logs/probe.c -o logs/device.o
+          python3 logs/check-ios-binary.py logs/device.o
+          # Both targets are arm64. The validator must still reject the simulator.
+          xcrun --sdk iphonesimulator clang -target arm64-apple-ios17.0-simulator \
+            -c logs/probe.c -o logs/simulator.o
+          if python3 logs/check-ios-binary.py logs/simulator.o > logs/simulator-rejection.txt 2>&1; then
+            echo 'ERROR: validation accepted a simulator binary' >&2
+            exit 1
+          fi
+          grep -q 'Expected an iPhone device binary' logs/simulator-rejection.txt
+
       - name: Prepare the unsigned Xcode project
         working-directory: source
         run: |
@@ -77,7 +105,16 @@ jobs:
           cd ios
           xcodegen generate
 
+      - name: Restore the compiled app if available
+        id: app-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: compiled-app/
+          # Bump v1 when changing compiler flags or other build settings.
+          key: iphone-app-v1-${{ runner.arch }}-xcode26.6-${{ env.SOURCE_REVISION }}-${{ env.RUST_PROFILE }}-${{ hashFiles('source/Cargo.lock', 'source/rust-toolchain.toml', 'source/ios/build-rust.sh', 'source/ios/project.yml') }}
+
       - name: Build the device app without signing
+        if: steps.app-cache.outputs.cache-hit != 'true'
         working-directory: source
         run: |
           set -euo pipefail
@@ -95,31 +132,56 @@ jobs:
             build 2>&1 | tee ../logs/xcodebuild.log
           git diff --exit-code -- Cargo.lock
 
+      - name: Archive the compiled app before packaging checks
+        if: steps.app-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p compiled-app
+          tar -czf compiled-app/AzerothSurvivors.app.tar.gz \
+            -C source/target-ios/xcode-dd/Build/Products/Release-iphoneos AzerothSurvivors.app
+          cp logs/*version.txt compiled-app/
+          printf '%s\n' "$SOURCE_REVISION" > compiled-app/source-revision.txt
+
+      - name: Save compiled app for packaging retries
+        if: steps.app-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: compiled-app/
+          key: ${{ steps.app-cache.outputs.cache-primary-key }}
+
+      - name: Preserve the compiled app as a recovery artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compiled-iphone-app
+          path: compiled-app/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
       - name: Validate and package the IPA
         run: |
           set -euo pipefail
-          app=source/target-ios/xcode-dd/Build/Products/Release-iphoneos/AzerothSurvivors.app
+          test "$(cat compiled-app/source-revision.txt)" = "$SOURCE_REVISION"
+          mkdir -p package/Payload
+          tar -xzf compiled-app/AzerothSurvivors.app.tar.gz -C package/Payload
+          app=package/Payload/AzerothSurvivors.app
           test -d "$app"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
-          lipo -verify_arch arm64 "$app/AzerothSurvivors"
+          python3 logs/check-ios-binary.py "$app/AzerothSurvivors"
           # A simulator app also can be arm64. Check the platform, not just the CPU.
           python3 - "$app" <<'PY'
           from pathlib import Path
-          import plistlib, subprocess, sys
+          import plistlib, sys
           app = Path(sys.argv[1])
           with (app / 'Info.plist').open('rb') as f:
               info = plistlib.load(f)
           assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS'], 'Not a device app'
           assert info.get('UIFileSharingEnabled') is True, 'Windows file sharing disabled'
           assert info.get('LSSupportsOpeningDocumentsInPlace') is True, 'Files app access disabled'
-          binary = app / info['CFBundleExecutable']
-          headers = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(binary)], text=True)
-          assert 'platform IOS\n' in headers, headers
-          assert not list(app.rglob('*.MPQ')), 'Game data must not be bundled'
-          print(headers)
+          assert (app / info['CFBundleExecutable']).is_file(), 'Missing app executable'
+          assert not any(p.suffix.lower() == '.mpq' for p in app.rglob('*')), 'Game data must not be bundled'
           PY
-          mkdir -p package/Payload
-          ditto "$app" package/Payload/AzerothSurvivors.app
           (
             cd package
             /usr/bin/zip -q -r ../output/AzerothSurvivors-unsigned.ipa Payload
@@ -132,7 +194,7 @@ jobs:
           printf 'Source: %s\nCommit: %s\nRunner: macos-26\nProfile: %s\n' \
             'rad:z2StRLdKwdJTCgS1gj1NcZMtK22KQ' "$SOURCE_REVISION" "$RUST_PROFILE" \
             > output/BUILD-INFO.txt
-          cp logs/*version.txt output/
+          cp compiled-app/*version.txt output/
           cp source/LICENSE-MIT source/LICENSE-APACHE output/
           cat > output/INSTALL.txt <<'TEXT'
           AZEROTH SURVIVORS FOR IPHONE — ALTSTORE CLASSIC
