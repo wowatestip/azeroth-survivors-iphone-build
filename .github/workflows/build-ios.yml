@@ -1,0 +1,205 @@
+name: Build iPhone IPA for AltStore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iphone-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  iphone:
+    runs-on: macos-26
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Reviewed iOS port, not the desktop/browser-only GitHub repository.
+      SOURCE_REVISION: 28c6e38cf1bab2509e29f67baebdcc3056758882
+      RUST_PROFILE: release
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_TERM_COLOR: always
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+    steps:
+      - name: Fetch the pinned iPhone source
+        run: |
+          set -euo pipefail
+          mkdir -p logs output
+          git init source
+          git -C source remote add origin https://seed.radicle.garden/z2StRLdKwdJTCgS1gj1NcZMtK22KQ.git
+          if ! git -C source fetch --depth 1 origin "$SOURCE_REVISION"; then
+            git -C source remote set-url origin https://iris.radicle.network/z2StRLdKwdJTCgS1gj1NcZMtK22KQ.git
+            git -C source fetch --depth 1 origin "$SOURCE_REVISION"
+          fi
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_REVISION"
+
+      - name: Install build tools
+        working-directory: source
+        run: |
+          set -euo pipefail
+          xcodebuild -version | tee ../logs/xcode-version.txt
+          brew install xcodegen
+          rustup show active-toolchain
+          rustup target add aarch64-apple-ios
+          rustc --version | tee ../logs/rust-version.txt
+          xcodegen --version | tee ../logs/xcodegen-version.txt
+          # Honor the repository's rust-toolchain.toml and Cargo.lock.
+          cargo fetch --locked --target aarch64-apple-ios
+          df -h .
+
+      - name: Prepare the unsigned Xcode project
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # AltStore supplies the Apple account, certificate and provisioning profile later.
+          printf 'BUNDLE_ID_PREFIX = org.personal\nDEVELOPMENT_TEAM =\n' > ios/Signing.xcconfig
+          # A generic icon is included upstream; no WoW data is needed to build.
+          cp ios/App/Assets.xcassets/AppIcon.appiconset/icon-placeholder.png \
+             ios/App/Assets.xcassets/AppIcon.appiconset/icon-1024.png
+          # Preserve upstream's Xcode build step, but prohibit dependency-lock changes in CI.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('ios/build-rust.sh')
+          text = path.read_text()
+          old = 'cargo build --profile "$PROFILE"'
+          if text.count(old) != 1:
+              raise SystemExit('Upstream build script changed; review the --locked patch.')
+          path.write_text(text.replace(old, 'cargo build --locked --profile "$PROFILE"'))
+          PY
+          cd ios
+          xcodegen generate
+
+      - name: Build the device app without signing
+        working-directory: source
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/AzerothSurvivors.xcodeproj \
+            -scheme AzerothSurvivors \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath target-ios/xcode-dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build 2>&1 | tee ../logs/xcodebuild.log
+          git diff --exit-code -- Cargo.lock
+
+      - name: Validate and package the IPA
+        run: |
+          set -euo pipefail
+          app=source/target-ios/xcode-dd/Build/Products/Release-iphoneos/AzerothSurvivors.app
+          test -d "$app"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
+          lipo -verify_arch arm64 "$app/AzerothSurvivors"
+          # A simulator app also can be arm64. Check the platform, not just the CPU.
+          python3 - "$app" <<'PY'
+          from pathlib import Path
+          import plistlib, subprocess, sys
+          app = Path(sys.argv[1])
+          with (app / 'Info.plist').open('rb') as f:
+              info = plistlib.load(f)
+          assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS'], 'Not a device app'
+          assert info.get('UIFileSharingEnabled') is True, 'Windows file sharing disabled'
+          assert info.get('LSSupportsOpeningDocumentsInPlace') is True, 'Files app access disabled'
+          binary = app / info['CFBundleExecutable']
+          headers = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(binary)], text=True)
+          assert 'platform IOS\n' in headers, headers
+          assert not list(app.rglob('*.MPQ')), 'Game data must not be bundled'
+          print(headers)
+          PY
+          mkdir -p package/Payload
+          ditto "$app" package/Payload/AzerothSurvivors.app
+          (
+            cd package
+            /usr/bin/zip -q -r ../output/AzerothSurvivors-unsigned.ipa Payload
+          )
+          /usr/bin/unzip -t output/AzerothSurvivors-unsigned.ipa > logs/ipa-integrity.txt
+          (
+            cd output
+            shasum -a 256 AzerothSurvivors-unsigned.ipa > SHA256SUMS.txt
+          )
+          printf 'Source: %s\nCommit: %s\nRunner: macos-26\nProfile: %s\n' \
+            'rad:z2StRLdKwdJTCgS1gj1NcZMtK22KQ' "$SOURCE_REVISION" "$RUST_PROFILE" \
+            > output/BUILD-INFO.txt
+          cp logs/*version.txt output/
+          cp source/LICENSE-MIT source/LICENSE-APACHE output/
+          cat > output/INSTALL.txt <<'TEXT'
+          AZEROTH SURVIVORS FOR IPHONE — ALTSTORE CLASSIC
+
+          This is an unsigned iPhone app. AltStore signs it using your Apple account.
+          It contains the engine and touch controls, but no WoW game data.
+
+          1. On your physical Windows PC, install AltServer and its required Apple
+             components using https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows
+             Follow AltStore's current iTunes/iCloud instructions before installing
+             other Apple device-management software.
+          2. Connect your iPhone by USB, unlock it, trust the PC and install AltStore
+             Classic from AltServer. Enable Developer Mode on the iPhone if prompted.
+          3. Extract this GitHub artifact ZIP on Windows. Transfer the INNER file
+             AzerothSurvivors-unsigned.ipa to the iPhone's Files app, e.g. using
+             iCloud Drive. Do not import the outer GitHub ZIP into AltStore.
+          4. Keep AltServer running with your PC and iPhone on the same network
+             (or connected by USB). On iPhone, open AltStore > My Apps > + and
+             choose the IPA. AltStore will re-sign and install it.
+          5. Copy the English WoW 1.12.1 (build 5875) Data/*.MPQ files using
+             compatible Apple file-sharing software on Windows. In the iPhone's
+             Files app, the final location must be:
+             On My iPhone > Azeroth Survivors > Data > <files>.MPQ
+             If files land at the top level, create Data and move them into it.
+             Avoid Data/Data. Allow about 6 GB of free space for the game/data.
+          6. Launch the game in landscape. Once installed with its data, the game
+             runs on the phone; Windows and the VPS can be switched off.
+
+          Free Apple accounts: refresh in AltStore within 7 days using AltServer.
+          AltStore itself counts toward Apple's three-app sideloading limit.
+          Refresh in place; deleting the game app also deletes its game data.
+
+          This build's packaging is checked in CI, but successful installation and
+          gameplay must still be tested on your phone. No jailbreak or JIT is needed
+          by this native compiled game. The build never needs your Apple password.
+
+          Upstream: https://radicle.network/nodes/iris.radicle.network/rad%3Az2StRLdKwdJTCgS1gj1NcZMtK22KQ
+          TEXT
+
+      - name: Upload the AltStore package
+        id: ipa
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: AzerothSurvivors-AltStore
+          path: output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Show download instructions
+        env:
+          ARTIFACT_URL: ${{ steps.ipa.outputs.artifact-url }}
+        run: |
+          {
+            echo '## iPhone build ready for device testing'
+            printf '\n[Download the AltStore package](%s)\n\n' "$ARTIFACT_URL"
+            echo 'Extract the artifact ZIP, then import **AzerothSurvivors-unsigned.ipa** into AltStore Classic.'
+            echo 'Read **INSTALL.txt** for Windows installation and game-data transfer.'
+            echo 'The package contains no game data. AltStore signs the app locally; no Apple credentials were used in CI.'
+            printf '\nSource commit: %s\n' "$SOURCE_REVISION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: iphone-build-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14
