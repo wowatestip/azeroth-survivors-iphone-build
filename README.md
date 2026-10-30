@@ -39,6 +39,8 @@ Free-account apps need refreshing within seven days using AltServer on the physi
 
 CI checks the Xcode build result, arm64 architecture, iPhoneOS platform (not Simulator), file-sharing settings, IPA ZIP integrity, and absence of bundled `.MPQ` files. It saves build logs even after a failed compilation. The engine is compiled natively and does not require enabling JIT.
 
+Before the long game build, CI compiles tiny device and simulator probes to test the same architecture/platform validator used for the game. It caches the completed app before packaging and also uploads a **compiled-iphone-app** recovery artifact. If only packaging needs fixing, subsequent runs can reuse the matching cached app. Cache keys include the source revision, Xcode version, Rust profile, toolchain/lockfile and build-script hashes; bump the recipe version in the workflow when changing other build settings. The recovery artifact is not the AltStore installation package; use **AzerothSurvivors-AltStore** after validation succeeds.
+
 The workflow has to complete on GitHub before an IPA exists. Successful packaging alone does not prove installation or gameplay: those must be tested on the iPhone. If the build fails, download **iphone-build-logs**. If AltStore rejects the app, retain its exact error message. If the game launches but cannot load a zone, check the data set and folder layout first.
 
 Changing source revision or Xcode version requires reviewing the port's build script and dependencies again. The one CI adjustment to upstream is adding `--locked` to its Cargo invocation; game and touch-control code are unchanged.
